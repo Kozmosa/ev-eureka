@@ -499,10 +499,226 @@ def predict_on_new_data(new_X_df_input):
     print("Blending complete for new data.")
     return blended_predictions_new
 
+def predict_single_instance_blended(single_instance_dict: dict) -> float:
+    """
+    Loads pre-trained blended model components and predicts on a single new data instance.
 
-if __name__ == '__main__':
-    main()
+    Args:
+        single_instance_dict (dict): A dictionary representing a single row of raw data,
+                                     with keys as feature names and values as feature values.
 
+    Returns:
+        float: The blended prediction for the single instance.
+               Returns np.nan if prediction fails.
+    """
+    print("--- Predicting on Single Instance ---")
+
+    # Check for model files
+    required_files = [
+        RF_MODEL_COMPONENTS['model'], RF_MODEL_COMPONENTS['preprocessor'],
+        BLENDER_WEIGHTS_FILE,
+        os.path.join(MODELS_DIR, 'final_glm_preprocessor.joblib'),
+        os.path.join(MODELS_DIR, 'final_glm_model_params.json'),
+        GLM_MODEL_INFO_FILE
+    ]
+    for f_path in required_files:
+        if not os.path.exists(f_path):
+            print(f"Error: Required model component not found: {f_path}")
+            return np.nan
+
+    # Load Blender Weights
+    try:
+        with open(BLENDER_WEIGHTS_FILE, 'r') as f:
+            blender_info = json.load(f)
+        w_glm, w_rf = blender_info['w_glm'], blender_info['w_rf']
+        print(f"Loaded blender weights: GLM={w_glm:.4f}, RF={w_rf:.4f}")
+    except Exception as e:
+        print(f"Error loading blender weights: {e}")
+        return np.nan
+
+    # Convert single instance dict to DataFrame
+    # Pandas DataFrame constructor with index=[0] creates a single-row DataFrame
+    new_X_df = pd.DataFrame(single_instance_dict, index=[0])
+
+    # --- GLM Prediction on New Data ---
+    print("Preparing GLM prediction for single instance...")
+    try:
+        glm_preprocessor_loaded = joblib.load(os.path.join(MODELS_DIR, 'final_glm_preprocessor.joblib'))
+        glm_params_loaded = pd.Series(joblib.load(os.path.join(MODELS_DIR, 'final_glm_model_params.json')))
+        with open(GLM_MODEL_INFO_FILE, 'r') as f:
+            glm_info = json.load(f)
+        glm_cols_fitted_on = glm_info['columns_fitted']
+
+        # Preprocess for GLM (using the logic from preprocess_for_glm but with a loaded preprocessor)
+        # The preprocess_for_glm function expects X_df, categorical_cols, numeric_cols if fitting.
+        # For transforming, it only needs X_df and the preprocessor.
+        new_X_glm_processed_transformed_array = glm_preprocessor_loaded.transform(new_X_df)
+        
+        # Get feature names from the loaded GLM preprocessor
+        try:
+            glm_processed_feature_names = glm_preprocessor_loaded.get_feature_names_out()
+        except AttributeError: # Fallback for older scikit-learn versions
+             glm_processed_feature_names = []
+             for name, trans, cols_list in glm_preprocessor_loaded.transformers_:
+                if hasattr(trans, 'get_feature_names_out'):
+                    glm_processed_feature_names.extend(trans.get_feature_names_out(cols_list))
+                elif hasattr(trans, 'get_feature_names'): # older OHE
+                    glm_processed_feature_names.extend(trans.get_feature_names(cols_list))
+                elif name == 'num' or trans == 'passthrough':
+                    glm_processed_feature_names.extend(cols_list)
+             if glm_preprocessor_loaded.remainder == 'passthrough' and hasattr(glm_preprocessor_loaded, 'feature_names_in_'):
+                remainder_cols = [col for i, col in enumerate(glm_preprocessor_loaded.feature_names_in_) if glm_preprocessor_loaded._remainder[1][i]]
+                glm_processed_feature_names.extend(remainder_cols)
+
+        new_X_glm_processed = pd.DataFrame(
+            new_X_glm_processed_transformed_array,
+            columns=glm_processed_feature_names,
+            index=new_X_df.index
+        )
+        new_X_glm_processed = sm.add_constant(new_X_glm_processed.astype(float), has_constant='add')
+
+
+        # Align columns post-transformation
+        X_glm_aligned = pd.DataFrame(0.0, index=new_X_glm_processed.index, columns=glm_cols_fitted_on)
+        common_cols = X_glm_aligned.columns.intersection(new_X_glm_processed.columns)
+        X_glm_aligned[common_cols] = new_X_glm_processed[common_cols]
+        if 'const' in glm_cols_fitted_on: # Ensure const is 1.0
+             X_glm_aligned['const'] = 1.0
+        else: # If const was not part of original fit columns (should not happen with sm.add_constant)
+            if 'const' in X_glm_aligned.columns: # If it was added but not in fitted_on, remove
+                X_glm_aligned = X_glm_aligned.drop(columns=['const'])
+
+
+        family_info = glm_info.get('family_info', {'class': 'Tweedie', 'link': 'Log', 'var_power': 1.5})
+        link_func_str = family_info.get('link', 'Log').lower()
+        if link_func_str == 'log':
+            link_func = sm.families.links.Log()
+        elif link_func_str == 'identity':
+            link_func = sm.families.links.identity()
+        # Add other links if necessary, e.g., sm.families.links.logit(), etc.
+        else: # Default or unknown
+            link_func = sm.families.links.Log()
+
+        glm_family_class_str = family_info.get('class', 'Tweedie').lower()
+        if glm_family_class_str == 'tweedie':
+            glm_family = sm.families.Tweedie(link=link_func, var_power=family_info.get('var_power', 1.5))
+        elif glm_family_class_str == 'gamma':
+            glm_family = sm.families.Gamma(link=link_func)
+        elif glm_family_class_str == 'poisson':
+            glm_family = sm.families.Poisson(link=link_func)
+        # Add other families if necessary
+        else: # Default
+            glm_family = sm.families.Tweedie(link=link_func, var_power=family_info.get('var_power', 1.5))
+
+
+        dummy_exog = pd.DataFrame(np.zeros((1, len(glm_cols_fitted_on))), columns=glm_cols_fitted_on)
+        dummy_endog = pd.Series([1.0]) # Ensure float for endog
+        dummy_glm_model = sm.GLM(endog=dummy_endog, exog=dummy_exog, family=glm_family)
+
+        pred_glm_new = dummy_glm_model.predict(params=glm_params_loaded, exog=X_glm_aligned[glm_cols_fitted_on])
+        # predict returns a pandas Series, get the single value
+        pred_glm_val = pred_glm_new.iloc[0] if isinstance(pred_glm_new, pd.Series) else pred_glm_new[0]
+        print("GLM prediction for single instance successful.")
+    except Exception as e:
+        print(f"Error making GLM prediction for single instance: {e}")
+        pred_glm_val = np.nan # Use np.nan for failure
+
+    # --- RF Prediction on New Data ---
+    print("Preparing RF prediction for single instance...")
+    try:
+        rf_model_loaded = joblib.load(RF_MODEL_COMPONENTS['model'])
+        rf_preprocessor_loaded = joblib.load(RF_MODEL_COMPONENTS['preprocessor'])
+
+        X_rf_temp = new_X_df.copy() # Start with the single instance DataFrame
+        # Date feature engineering (skipped if RF_DATE_FEATURES is empty)
+        for col in RF_DATE_FEATURES:
+            if col in X_rf_temp.columns:
+                X_rf_temp[col] = pd.to_datetime(X_rf_temp[col], errors='coerce')
+                X_rf_temp[f'{col}_YEAR'] = X_rf_temp[col].dt.year
+                X_rf_temp[f'{col}_MONTH'] = X_rf_temp[col].dt.month
+                X_rf_temp[f'{col}_DAY'] = X_rf_temp[col].dt.day
+        X_rf_temp = X_rf_temp.drop(columns=RF_DATE_FEATURES, errors='ignore')
+
+        new_X_rf_processed_array = rf_preprocessor_loaded.transform(X_rf_temp)
+        pred_rf_new = rf_model_loaded.predict(new_X_rf_processed_array)
+        # predict returns a numpy array, get the single value
+        pred_rf_val = pred_rf_new[0] if isinstance(pred_rf_new, np.ndarray) else pred_rf_new
+        print("RF prediction for single instance successful.")
+    except Exception as e:
+        print(f"Error making RF prediction for single instance: {e}")
+        pred_rf_val = np.nan # Use np.nan for failure
+
+    # Blend Predictions
+    if np.isnan(pred_glm_val) or np.isnan(pred_rf_val):
+        print("Blending failed due to error in base model prediction.")
+        return np.nan
+
+    blended_prediction_val = w_glm * pred_glm_val + w_rf * pred_rf_val
+    print(f"Blending complete for single instance. GLM pred: {pred_glm_val:.4f}, RF pred: {pred_rf_val:.4f}, Blended: {blended_prediction_val:.4f}")
+    return blended_prediction_val
+
+def single_predict_main():
+    # First, ensure the main() function has run at least once to train and save models.
+    # If you haven't run main() after the latest changes, do it now.
+    # print("Running main training and saving components first if not done yet...")
+    # main() # Comment this out if models are already trained and saved
+
+    print("\n\n--- Example: Predicting on a single new data instance ---")
+
+    # Define a single instance dictionary matching your raw data structure
+    # This should align with the columns of the CSV file your 'main()' function uses
+    single_raw_instance = {
+        'brand': '品牌A', # Example: ensure this matches a known brand or tests handle_unknown
+        'average_speed': 55.0,
+        'avg_daily_charges': 1,
+        'fatigue_driving_ratio': 0.05,
+        'late_night_trip_ratio': 0.1,
+        'avg_late_night_trip_mileage': 10.5,
+        'high_temp_driving_ratio': 0.02,
+        'battery_type_lfp': 0,
+        'initial_battery_soc': 85.0,
+        'avg_charge_duration': 7200.0,
+        'insurance_commercial_third_party': 1,
+        'insurance_compulsory_third_party': 0
+        # Add any other features that were present in the original training data,
+        # even if they are all NaNs, so the preprocessor sees all expected columns.
+    }
+
+    # If your original dataset (used in main()) had more columns, ensure they are present here,
+    # possibly with placeholder values like np.nan if the actual value for this instance isn't known.
+    # Example: If 'another_feature' was in training data:
+    # single_raw_instance['another_feature'] = np.nan
+
+    # To be more robust, try to get the full list of columns from the original training data.
+    # This step is important if preprocessors expect all original columns.
+    try:
+        if os.path.exists(DATASET_FILE): # DATASET_FILE should be defined globally
+            original_training_cols = pd.read_csv(DATASET_FILE, nrows=0).columns.tolist()
+            if original_training_cols[0].startswith('Unnamed: '):
+                original_training_cols = original_training_cols[1:]
+            if TARGET_COLUMN in original_training_cols: # TARGET_COLUMN should be defined globally
+                original_training_cols.remove(TARGET_COLUMN)
+
+            for col in original_training_cols:
+                if col not in single_raw_instance:
+                    print(f"Note: Adding missing original training column '{col}' as np.nan to single instance.")
+                    single_raw_instance[col] = np.nan
+    except Exception as e:
+        print(f"Warning: Could not fetch original training columns to ensure schema consistency for single instance: {e}")
+
+
+    # if MODELS_DIR not in globals(): # Quick check if script is run partially
+    if False: # Quick check if script is run partially
+        print("Please ensure MODELS_DIR and other global constants are defined.")
+        print("Usually, this means running the full script or defining them before this call.")
+    else:
+        prediction = predict_single_instance_blended(single_raw_instance)
+        if not np.isnan(prediction):
+            print(f"\nPredicted '{TARGET_COLUMN}' for the single instance: {prediction:.4f}")
+        else:
+            print(f"\nPrediction for the single instance failed.")
+
+def sample_new_predict_main():
     print("\n\n--- Example: Predicting on sample new data ---")
     num_new_samples = 5
     sample_new_data = pd.DataFrame({
@@ -542,3 +758,8 @@ if __name__ == '__main__':
     if final_blended_preds is not None:
         print("\nFinal Blended Predictions on New Sample Data:")
         print(pd.Series(final_blended_preds, index=sample_new_data.index).head())
+
+if __name__ == '__main__':
+    main()
+
+    single_predict_main()
